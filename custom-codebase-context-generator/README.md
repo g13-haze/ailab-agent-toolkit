@@ -240,3 +240,9 @@ python3 -m unittest discover codebase-context-generator/tests
 # Or if pytest is installed:
 pytest codebase-context-generator/tests
 ```
+## Credits
+
+- **Original author:** Mikhail Larchanka.
+- **Modified and maintained by:** A.I. Lab (g13-haze).
+
+This version includes improvements to dependency resolution, symbol graphs, deterministic generation, function signature extraction, context verification, and regression testing.
