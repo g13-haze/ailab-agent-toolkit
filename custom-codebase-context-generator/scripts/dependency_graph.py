@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""
+Dependency Graph Analyzer.
+Processes import relationships from source files to identify:
+- Entrypoints vs Core Hubs/Utilities
+- Internal dependency graph (who imports whom)
+- Third-party / external ecosystem dependencies
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
+
+try:
+    from common import PythonModuleResolver, is_python_path, load_json, save_json
+except ImportError:
+    from .common import PythonModuleResolver, is_python_path, load_json, save_json
+
+# Standard modules that were never listed as external dependencies
+_IGNORED_EXTERNALS = {"typing", "os", "sys", "re", "json", "pathlib", "math", "time"}
+
+
+def clean_import_source(source_str: str) -> str:
+    """Extracts the module specifier from an import source or raw import text."""
+    if not source_str:
+        return ""
+    # If source string contains quotes (e.g., from regex import clause or Tree-sitter import), extract the module path
+    m = re.search(r"['\"]([^'\"]+)['\"]", source_str)
+    if m:
+        clean_src = m.group(1).strip()
+    else:
+        clean_src = source_str.strip("\"'; ()")
+    if not clean_src or clean_src in ("{", "}", "{ ") or re.match(r"^\{\s*$", clean_src):
+        return ""
+    return clean_src
+
+
+def normalize_import_path(source_str: str, current_file: str, known_files: Set[str]) -> Tuple[str, bool]:
+    """
+    Attempts to match an import string to an internal project file (non-Python files;
+    Python imports go through common.PythonModuleResolver).
+    Returns (resolved_target_or_module, is_internal). Deterministic: candidates are
+    checked in sorted order and bare package names never match by suffix.
+    """
+    clean_src = clean_import_source(source_str)
+    if not clean_src:
+        return "", False
+
+    # Relative path resolution (JS/TS/Python relative)
+    if clean_src.startswith("."):
+        curr_dir = Path(current_file).parent
+        # Resolve relative to current directory and normalize path
+        candidate = os.path.normpath((curr_dir / clean_src).as_posix()).replace("\\", "/")
+        base_cand = os.path.splitext(candidate)[0]
+
+        # Try matching with candidate and base_cand across known file extensions (e.g. .js -> .ts)
+        for c in [candidate, base_cand]:
+            for ext in ["", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".rs"]:
+                cand_with_ext = c + ext if ext else c
+                if cand_with_ext in known_files:
+                    return cand_with_ext, True
+                # Also check index files (e.g. foo/index.ts)
+                index_cand = f"{c}/index{ext}"
+                if index_cand in known_files:
+                    return index_cand, True
+
+    # Absolute or package-style matching: exact path first, then a suffix at a path
+    # component boundary, the latter only for dotted or slashed specifiers (e.g. Java
+    # com.example.Foo), never for bare names such as "react".
+    ordered = sorted(known_files)
+    dot_path = clean_src.replace(".", "/")
+    for kf in ordered:
+        kf_no_ext = Path(kf).with_suffix("").as_posix()
+        if clean_src == kf or clean_src == kf_no_ext or dot_path == kf_no_ext:
+            return kf, True
+    if not clean_src.startswith(".") and ("." in clean_src or "/" in clean_src):
+        for kf in ordered:
+            kf_no_ext = Path(kf).with_suffix("").as_posix()
+            if kf.endswith("/" + clean_src) or kf_no_ext.endswith("/" + clean_src) or kf_no_ext.endswith("/" + dot_path):
+                return kf, True
+
+    # If unmatched internally, classify as external dependency
+    # Extract root package name (e.g. 'react-dom/client' -> 'react-dom')
+    parts = clean_src.split("/")
+    if parts[0].startswith("@") and len(parts) > 1:
+        root_pkg = f"{parts[0]}/{parts[1]}"
+    else:
+        root_pkg = parts[0].split(".")[0]
+
+    return root_pkg, False
+
+
+def is_python_entry(f_entry: Dict[str, Any]) -> bool:
+    return f_entry.get("language") == "python" or is_python_path(f_entry.get("path", ""))
+
+
+def build_dependency_graph(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """Builds internal and external dependency maps from AST manifest."""
+    files_data = sorted(manifest.get("files", []), key=lambda f: f["path"])
+    known_list: List[str] = sorted({f["path"] for f in files_data})
+    known_files: Set[str] = set(known_list)
+    py_resolver = PythonModuleResolver(f["path"] for f in files_data if is_python_entry(f))
+
+    internal_graph: Dict[str, List[str]] = {f: [] for f in known_list}
+    reverse_graph: Dict[str, List[str]] = {f: [] for f in known_list}
+    external_deps: Set[str] = set()
+    file_external_deps: Dict[str, List[str]] = {f: [] for f in known_list}
+    unresolved: Dict[str, Set[str]] = {}
+
+    def add_internal(fpath: str, target: str) -> None:
+        if target in known_files and target != fpath:
+            if target not in internal_graph[fpath]:
+                internal_graph[fpath].append(target)
+            if fpath not in reverse_graph[target]:
+                reverse_graph[target].append(fpath)
+
+    def add_external(fpath: str, target: str) -> None:
+        # Filter out standard keywords or empty
+        if target and target not in _IGNORED_EXTERNALS:
+            external_deps.add(target)
+            if target not in file_external_deps[fpath]:
+                file_external_deps[fpath].append(target)
+
+    for f_entry in files_data:
+        fpath = f_entry["path"]
+        syms = f_entry.get("symbols", {})
+        imports = syms.get("imports", [])
+        is_py = is_python_entry(f_entry)
+
+        for imp in imports:
+            if is_py:
+                res = py_resolver.resolve_import(imp, fpath)
+                for target in res["targets"]:
+                    add_internal(fpath, target)
+                for target in res["external"]:
+                    add_external(fpath, target)
+                for src in res["unresolved"]:
+                    unresolved.setdefault(fpath, set()).add(src)
+                continue
+
+            src = imp.get("source", "")
+            if not src and "raw" in imp:
+                src = clean_import_source(imp["raw"])
+
+            target, is_internal = normalize_import_path(src, fpath, known_files)
+            if is_internal and target in known_files:
+                add_internal(fpath, target)
+            elif clean_import_source(src).startswith("."):
+                # Relative specifier that matches no project file
+                unresolved.setdefault(fpath, set()).add(clean_import_source(src))
+            elif target:
+                add_external(fpath, target)
+
+    for adjacency in (internal_graph, reverse_graph, file_external_deps):
+        for key in adjacency:
+            adjacency[key].sort()
+
+    # Calculate metrics
+    # Entry points: files that nobody internally imports, but that import other things or have functions
+    entrypoints = []
+    # Hub modules: files that are heavily imported by others
+    hubs = []
+
+    for fpath in known_list:
+        in_degree = len(reverse_graph[fpath])
+        out_degree = len(internal_graph[fpath])
+
+        if in_degree == 0 and out_degree > 0:
+            entrypoints.append({
+                "path": fpath,
+                "out_degree": out_degree,
+                "note": "Root orchestrator or CLI/service entry point"
+            })
+        elif in_degree >= 2:
+            hubs.append({
+                "path": fpath,
+                "in_degree": in_degree,
+                "imported_by": reverse_graph[fpath],
+                "note": "Core shared component or utility hub"
+            })
+
+    entrypoints.sort(key=lambda x: (-x["out_degree"], x["path"]))
+    hubs.sort(key=lambda x: (-x["in_degree"], x["path"]))
+
+    return {
+        "total_internal_edges": sum(len(v) for v in internal_graph.values()),
+        "entrypoints": entrypoints,
+        "hub_modules": hubs,
+        "external_dependencies": sorted(list(external_deps)),
+        "internal_graph": internal_graph,
+        "reverse_graph": reverse_graph,
+        "file_external_deps": file_external_deps,
+        "unresolved_imports": {k: sorted(v) for k, v in sorted(unresolved.items())},
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze dependency graph from AST manifest.")
+    parser.add_argument("--manifest", "-m", type=str, default=".context_cache/ast_manifest.json", help="Path to AST manifest JSON.")
+    parser.add_argument("--out", "-o", type=str, default=None, help="Output JSON path (default: .context_cache/dependency_graph.json).")
+
+    args = parser.parse_args()
+    manifest_path = Path(args.manifest).resolve()
+
+    if not manifest_path.exists():
+        print(f"Error: manifest file {manifest_path} not found. Run ast_scanner.py first.")
+        sys.exit(1)
+
+    manifest_data = load_json(manifest_path)
+    graph = build_dependency_graph(manifest_data)
+
+    out_file = Path(args.out) if args.out else (manifest_path.parent / "dependency_graph.json")
+    save_json(graph, out_file)
+
+    print(f"Dependency analysis complete:")
+    print(f"- Total internal edges: {graph['total_internal_edges']}")
+    print(f"- Identified {len(graph['entrypoints'])} potential entrypoints")
+    print(f"- Identified {len(graph['hub_modules'])} core hub modules")
+    print(f"- External dependencies detected: {len(graph['external_dependencies'])}")
+    print(f"- Files with unresolved imports: {len(graph['unresolved_imports'])}")
+    print(f"Saved graph to {out_file}")
+
+
+if __name__ == "__main__":
+    main()
