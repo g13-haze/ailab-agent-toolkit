@@ -1,0 +1,9 @@
+{
+  "name": "ailab-engineering",
+  "displayName": "A.I. Lab Engineering",
+  "version": "0.2.2",
+  "description": "Deterministic guardrails (no mass staging, no destructive cleanup, immutable evidence, owner approval for publishing), session context after compaction, task-owned scratch lifecycle, work packages with a bounded two-axis review loop, read-only code and change intelligence, and the knowledge review.",
+  "author": {
+    "name": "A.I. Lab"
+  }
+}

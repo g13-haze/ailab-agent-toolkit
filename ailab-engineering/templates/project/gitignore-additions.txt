@@ -1,0 +1,4 @@
+# --- ailab-engineering ---
+.claude/wp/ACTIVE
+.claude/settings.local.json
+CLAUDE.local.md

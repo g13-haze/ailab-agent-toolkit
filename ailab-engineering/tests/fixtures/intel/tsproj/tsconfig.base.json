@@ -1,0 +1,10 @@
+{
+  // shared options
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"],   /* alias with a slash-star that a naive comment stripper would eat */
+      "@lib": ["src/lib/index.ts"],
+    },
+  },
+}

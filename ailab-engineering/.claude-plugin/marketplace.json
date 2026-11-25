@@ -1,0 +1,14 @@
+{
+  "name": "ailab",
+  "description": "A.I. Lab plugins for Claude Code agents",
+  "owner": {
+    "name": "A.I. Lab"
+  },
+  "plugins": [
+    {
+      "name": "ailab-engineering",
+      "source": "./plugins/ailab-engineering",
+      "description": "Guardrail hooks, review subagents, work-package skills and code intelligence for A.I. Lab engineering"
+    }
+  ]
+}
